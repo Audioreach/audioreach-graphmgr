@@ -1,167 +1,91 @@
----
 name: _test
-description: Run tests on the build
+description: Trigger LAVA tests on the build
 
 on:
   workflow_call:
 
-env:
-  IMAGE_NAME: core-image-base-qcs6490-rb3gen2-core-kit.rootfs-20250514094843.qcomflash
-
 jobs:
-  process_image:
-    runs-on: self-hosted
-    outputs:
-      presigned_url: ${{ steps.upload_tar_image.outputs.presigned_url }}
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.ref }}
-
-      - name: Download build artifact
-        id: download_build_artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: build.tar
-          path: ${{ github.workspace }}
-
-      - name: Extract build artifact
-        id: extract_build_artifact
-        shell: bash
-        run: |
-          #!/bin/bash
-          set -e
-
-          mkdir -p ${{ github.workspace }}/build
-          echo "Extracting the build artifact"
-          tar -xvf ${{ github.workspace }}/build.tar -C ${{ github.workspace }}/build
-          echo "Build artifact extracted successfully"
-
-      - name: Pull meta-ar pre compiled image
-        id: pull_meta_ar
-        uses: ./.github/actions/aws-s3-exchanger
-        with:
-          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          s3_bucket: qli-stg-kernel-gh-artifacts
-          mode: download
-          download_filename: ${{ env.IMAGE_NAME }}.tar.gz
-          location: meta-ar-test
-
-      - name: Extract image and mount
-        id: extract_image
-        shell: bash
-        run: |
-          #!/bin/bash
-          set -e
-
-          echo "Extracting the image"
-          tar -xvf ${{ env.IMAGE_NAME }}.tar.gz
-          echo "Image extracted successfully"
-          cd ${{ env.IMAGE_NAME }}
-          mkdir -p /tmp/rootfs
-          fuse-ext2 rootfs.img /tmp/rootfs -o rw+
-          echo "Image mounted successfully"
-
-          # Copy the arg build files to the mounted image
-          cp -r ${{ github.workspace }}/build/usr/* /tmp/rootfs/usr/
-          cp -r ${{ github.workspace }}/build/etc/* /tmp/rootfs/etc
-
-          echo "Build files copied successfully"
-
-          # Unmount the image
-          fusermount -u /tmp/rootfs
-          echo "Image unmounted successfully"
-
-      - name: Create tar image for qcomflash directory
-        id: create_tar_image
-        shell: bash
-        run: |
-          #!/bin/bash
-          set -e
-
-          echo "Creating tar image for qcomflash directory"
-          tar -cvf core-image-base-qcs6490-rb3gen2-core-kit.rootfs.qcomflash.tar.gz ${{ env.IMAGE_NAME }}/
-          echo "Tar image created successfully"
-
-      - name: Upload tar image
-        id: upload_tar_image
-        uses: ./.github/actions/aws-s3-exchanger
-        with:
-          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          s3_bucket: qli-stg-kernel-gh-artifacts
-          local_file: core-image-base-qcs6490-rb3gen2-core-kit.rootfs.qcomflash.tar.gz
-          location: meta-ar-test/test
-          mode: upload
-
-  prepare-job-list:
-    needs: process_image
-    runs-on: ubuntu-latest
-    outputs:
-      jobmatrix: ${{ steps.listjobs.outputs.jobmatrix }}
+  submit_lava:
+    runs-on:
+      group: GHA-Audioreach-SelfHosted-RG
+      labels: [ self-hosted, audior-prd-u2204-x64-large-od-ephem ]
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          repository: Audioreach/meta-ar-test
-          token: ${{ secrets.QTI_FF }}
+          repository: Audioreach/meta-ar
+
+      - name: Download presigned URL
+        id: download_url
+        uses: actions/download-artifact@v4
+        with:
+          name: presigned_url.txt
+          path: ${{ github.workspace }}
+
+      - name: Get build URL
+        id: get_build_url
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const filePath = `${{ github.workspace }}/presigned_url.txt`
+            const url = fs.readFileSync(filePath, 'utf8').toString().trim()
+            console.log(url)
+            core.setOutput('build_url', url)
           
       - name: Print trigger
         run: |
           echo "Triggered by ${{ github.event_name }}"
-          echo "Build URL: ${{ needs.process_image.outputs.presigned_url }}"
+          echo "Build URL: --->"
+          echo "${{ steps.get_build_url.outputs.build_url }}"
+
       - name: "List jobs"
         id: listjobs
         run: |
-          JOBFILES=$(find ci/lava/ -name *.yaml)
-          JOBFILES=$(echo "$JOBFILES" | sed -e "s/^/\"/" | sed -e "s/$/\",/" | tr -d "\n" | sed -e "s/.$//")
-          JOBFILES="[${JOBFILES}]"
-          J=$(jq -cn --argjson jobfiles "$JOBFILES" '{target: $jobfiles}')
-          echo "jobmatrix=$J" >> $GITHUB_OUTPUT
-          echo "Preparing testjob files"
+          target_file="ci/lava/qcs6490-rb3gen2-core-kit/boot.yaml"
+          if [ ! -f "$target_file" ]; then
+            echo "Target file $target_file does not exist."
+            echo "target_file=" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
-  submit-job:
-    needs: [ process_image, prepare-job-list ]
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.prepare-job-list.outputs.jobmatrix) }}
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          repository: Audioreach/meta-ar-test
-          token: ${{ secrets.QTI_FF }}
-
-      - name: "Update test definition ${{ matrix.target }}"
-        run: |
-          TARGET=${{ matrix.target }}
+          TARGET=${target_file}
           FIND_PATH="${TARGET#*/}"
           DEVICE_TYPE_PATH="${FIND_PATH%/*}"
           DEVICE_TYPE="${DEVICE_TYPE_PATH#*/}"
           BUILD_FILE_NAME="core-image-base-qcs6490-rb3gen2-core-kit.rootfs.qcomflash.tar.gz"
-          BUILD_DOWNLOAD_URL="${{ needs.process_image.outputs.presigned_url }}"
-          sed -i "s|{{DEVICE_TYPE}}|${DEVICE_TYPE}|g" "${{ matrix.target }}"
-          sed -i "s|{{GITHUB_SHA}}|${GITHUB_SHA}|g" "${{ matrix.target }}"
-          ESCAPED_URL=$(echo "$BUILD_DOWNLOAD_URL" | sed 's/[&/?=]/\\&/g')
-          sed -i "s|{{BUILD_DOWNLOAD_URL}}|$ESCAPED_URL|g" "${{ matrix.target }}"
-          sed -i "s|{{BUILD_FILE_NAME}}|${BUILD_FILE_NAME}|g" "${{ matrix.target }}"
-          sed -i "s|{{GITHUB_RUN_ID}}|${GITHUB_RUN_ID}|g" "${{ matrix.target }}"
-          cat "${{ matrix.target }}"
+          BUILD_DOWNLOAD_URL="${{ steps.get_build_url.outputs.build_url }}"
+          sed -i "s|{{DEVICE_TYPE}}|${DEVICE_TYPE}|g" "${target_file}"
+          sed -i "s|{{GITHUB_SHA}}|${GITHUB_SHA}|g" "${target_file}"
+          ESCAPED_URL=$(printf '%s\n' "$BUILD_DOWNLOAD_URL" | sed 's/[&/?=]/\\&/g')
+          sed -i "s|{{BUILD_DOWNLOAD_URL}}|${ESCAPED_URL}|g" "${target_file}"
+          sed -i "s|{{BUILD_FILE_NAME}}|${BUILD_FILE_NAME}|g" "${target_file}"
+          sed -i "s|{{GITHUB_RUN_ID}}|${GITHUB_RUN_ID}|g" "${target_file}"
+          cat "${target_file}"
+          echo "target=${target_file}" >> "$GITHUB_OUTPUT"
 
-      - name: Submit ${{ matrix.target }}
+      - name: Test with LAVA
+        if: ${{ steps.listjobs.outputs.target != '' }}
+        id: submit_job
         timeout-minutes: 20
         uses: foundriesio/lava-action@v6
         with:
           lava_token: ${{ secrets.LAVATOKEN }}
           lava_url: 'lava.infra.foundries.io'
-          job_definition: ${{ matrix.target }}
+          job_definition: ${{ steps.listjobs.outputs.target }}
           wait_for_job: true
           fail_action_on_failure: false
           save_result_as_artifact: true
           save_job_details: true
+
+      - name: Update Summary
+        if: success() || failure()
+        run: |
+          if [ "${{ steps.submit_job.outcome }}" == "success" ]; then
+            echo "## Test Job Summary" >> $GITHUB_STEP_SUMMARY
+            echo ":heavy_check_mark: Test job completed successfully." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Test Job Summary" >> $GITHUB_STEP_SUMMARY
+            echo ":x: Test job failed." >> $GITHUB_STEP_SUMMARY
+          fi

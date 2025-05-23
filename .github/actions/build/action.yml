@@ -3,33 +3,44 @@ name: build
 description: Build Action
 
 inputs:
-  uid:
+  docker_image:
     required: true
-    description: Docker User ID
-  gid:
-    required: true
-    description: Docker Group ID
+    description: Docker image for build
 
 runs:
   using: 'composite'
   steps:
+   
     - name: Build Project
       id: build
       shell: bash
       run: |
         # Load the build arguments
         set +x
-
         # Build inside a docker container
-        source ./install/environment-setup-armv8-2a-poky-linux
-        autoreconf -Wcross --verbose --install --force --exclude=autopoint
-        autoconf --force
+        docker run \
+          --rm \
+          --user $(id -u):$(id -g) \
+          -v $PWD:$PWD \
+          -w $PWD \
+          -e "GITHUB_WORKSPACE=${{ github.workspace }}" \
+          -e "BUILD_ARGS=${{ env.BUILD_ARGS }}" \
+          -e "KERNEL_VERSION=${{ env.KERNEL_VERSION }}" \
+          --privileged \
+          ${{ inputs.docker_image }} \
+          bash -c "
+            set +x
+            source ./install/environment-setup-armv8-2a-poky-linux
+            autoreconf -Wcross --verbose --install --force --exclude=autopoint
+            autoconf --force
 
-        ./configure CFLAGS="-Wno-incompatible-pointer-types" ${{ env.BUILD_ARGS }} 
-        # make
-        make DESTDIR=${{ github.workspace }}/build install
+            # Run the configure script with the specified arguments
+            ./configure CFLAGS=\"-Wno-incompatible-pointer-types\" \${BUILD_ARGS}
+            # make
+            make DESTDIR=\${GITHUB_WORKSPACE}/build install
+            "
 
-    - name: Create build.tar 
+    - name: Create build.tar
       id: create_build_tar
       shell: bash
       run: |
